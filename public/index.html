@@ -137,6 +137,7 @@
           </div>
           <div id="room-handover" class="room-handover" hidden></div>
           <div id="room-protection" class="room-protection" hidden></div>
+          <div id="room-stops" class="room-stops" hidden></div>
           <div class="row transport" id="room-transport">
             <button id="btn-room-play" class="primary">▶ 播放</button>
             <button id="btn-room-pause">⏸ 暂停</button>
@@ -195,6 +196,34 @@
 
           <div id="room-program-viewer" class="muted" hidden>
             观看者只读：当前段、轮次与时码见上方状态条；编排控制仅持密钥者可用。
+          </div>
+        </div>
+
+        <!-- 讨论停点（主持人预置；播放连续经过即自动暂停并显示原因） -->
+        <div class="card" id="room-stops-card">
+          <h2>讨论停点</h2>
+          <p class="muted">
+            主持人可预置一组<strong>讨论停点</strong>（不重复的非负演出时码，不超过版本末尾）：
+            播放<strong>连续经过</strong>下一停点时自动暂停在该停点并显示原因（自动暂停不增加修订号），
+            刷新、重启、观看者重连后状态一致。继续播放会<strong>越过刚触发的停点</strong>；
+            循环排演每次重新经过仍会暂停，段尾瞬时跳转不触发被跳过的停点；
+            与超载边界同时抵达时<strong>超载优先</strong>。手动跳转到停点不会立即触发。
+            提交需携带控制密钥与当前修订号，整组校验后原子替换；提交空组即清除全部停点。
+          </p>
+
+          <div id="room-stops-host">
+            <div class="row">
+              <input type="text" id="room-stops-input" style="flex:1"
+                placeholder="停点时码（秒），逗号或空格分隔，如 12 45.5 90；留空提交 = 清除全部停点" />
+              <button type="button" id="btn-room-stops-submit" class="primary">📌 保存停点（整组替换）</button>
+              <button type="button" id="btn-room-stops-clear">清除全部停点</button>
+            </div>
+            <div class="muted">当前已预置：<span id="room-stops-current">无</span></div>
+            <div id="room-stops-error" class="error-line" hidden></div>
+          </div>
+
+          <div id="room-stops-viewer" class="muted" hidden>
+            观看者只读：停点列表与触发状态见上方状态条；维护停点仅持密钥者可用。
           </div>
         </div>
 

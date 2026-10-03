@@ -140,6 +140,9 @@ CREATE TABLE IF NOT EXISTS rooms (
   -- 惰性落库与末尾停住一样不增加控制修订号；服务重启后据此恢复保护状态。
   tripped_circuit_id INTEGER,
   tripped_time       REAL,
+  -- 讨论停点自动暂停时固化的停点时码；非停点自动暂停状态为 NULL。
+  -- 与超载触发落库同一口径：惰性落库、不增加控制修订号，重启后据此恢复暂停原因。
+  stopped_time       REAL,
   created_at  REAL NOT NULL
 );
 
@@ -173,6 +176,16 @@ CREATE TABLE IF NOT EXISTS room_programs (
   prog_time  REAL NOT NULL DEFAULT 0,        -- 当前段内（或段起点）演出时码
   finished   INTEGER NOT NULL DEFAULT 0      -- 1 = 整次编排已全部走完，停在末段终点
 );
+
+-- 共享房间讨论停点：主持人凭控制密钥与房间修订号提交一组不重复的非负演出时码
+-- （不超过房间固定版本末尾），整组校验后原子替换；空组提交 = 清除全部停点（删除本行）。
+-- 播放按服务端墙钟连续经过下一停点时准确暂停在该停点（惰性落库 rooms.stopped_time，
+-- 不增加控制修订号）；继续播放越过刚触发的停点，循环排演每次重新经过仍暂停，
+-- 段尾瞬时跳回不触发被跳过的停点；与超载边界同时抵达时超载优先。
+CREATE TABLE IF NOT EXISTS room_stops (
+  room_id INTEGER PRIMARY KEY REFERENCES rooms(id) ON DELETE CASCADE,
+  stops   TEXT NOT NULL                      -- JSON：升序、不重复的非负演出时码数组
+);
 `;
 
 let db;
@@ -198,6 +211,10 @@ function migrate(database) {
     }
     if (!roomCols.includes('tripped_time')) {
       database.exec('ALTER TABLE rooms ADD COLUMN tripped_time REAL');
+    }
+    // 讨论停点自动暂停落库列：旧库补列（NULL = 非停点自动暂停状态）
+    if (!roomCols.includes('stopped_time')) {
+      database.exec('ALTER TABLE rooms ADD COLUMN stopped_time REAL');
     }
   }
 }

@@ -707,6 +707,7 @@ async function enterRoom(code, key, initialView) {
   renderRoomProtection();
   renderRoomHandover();
   renderRoomProgram();
+  renderRoomStops();
 
   document.querySelector('.tab[data-tab="room"]').click();
 }
@@ -760,6 +761,9 @@ function roomCurrentTime(nowSec) {
   // （服务端会在该边界自动暂停，下一次轮询即把锚点校正为暂停在边界）
   const p = r.view.protection;
   if (p && p.enabled && p.next_trip && t > p.next_trip.time) t = p.next_trip.time;
+  // 讨论停点：本地推算同样不越过下一停点（服务端在该停点自动暂停，下次轮询校正）
+  const st = r.view.stops;
+  if (st && st.next && t > st.next.time) t = st.next.time;
   return t;
 }
 
@@ -794,6 +798,7 @@ async function pollRoom() {
     renderRoomProtection();
     renderRoomHandover();
     renderRoomProgram();
+    renderRoomStops();
     updateRoomHandoverCountdown();
   } catch {
     /* 单次轮询失败不打断观看：下一周期重试 */
@@ -842,6 +847,7 @@ async function roomControl(action, extra = {}) {
     renderRoomProtection();
     renderRoomHandover();
     renderRoomProgram();
+    renderRoomStops();
   } catch (err2) {
     if (err2.status === 409) {
       await pollRoom(); // 过期：按服务端最新状态校时后提示重试
@@ -857,6 +863,7 @@ async function roomControl(action, extra = {}) {
     renderRoomRole();
     renderRoomHandover();
     renderRoomProgram();
+    renderRoomStops();
     showErr($('room-error'), `控制失败：${err2.message}`);
   }
 }
@@ -1074,6 +1081,7 @@ $('btn-room-prog-submit').addEventListener('click', async () => {
     renderRoomProtection();
     renderRoomHandover();
     renderRoomProgram();
+    renderRoomStops();
   } catch (e) {
     if (e.status === 409) await pollRoom();
     else if (e.status === 403) {
@@ -1106,6 +1114,7 @@ $('btn-room-prog-cancel').addEventListener('click', async () => {
     renderRoomProtection();
     renderRoomHandover();
     renderRoomProgram();
+    renderRoomStops();
   } catch (e) {
     if (e.status === 409) await pollRoom();
     renderRoomProgram();
@@ -1156,6 +1165,134 @@ function renderRoomProtection() {
   box.className = `room-protection ${cls}`;
   box.innerHTML = html;
 }
+
+/* --------------------------- 讨论停点 --------------------------- */
+// 主持人预置一组讨论停点（整组替换，空组清除）；播放连续经过即自动暂停并显示原因。
+// 观看者只读查看停点列表与触发状态；本地推算同样不越过下一停点（下次轮询由服务端纠正）。
+
+// 状态条（控制卡内）+ 停点卡（主持人编辑器 / 观看者只读列表）
+function renderRoomStops() {
+  const r = state.room;
+  if (!r) return;
+  const bar = $('room-stops');
+  const st = r.view.stops || { points: [] };
+  const points = st.points || [];
+  const isHost = !!r.key;
+
+  // 状态条：触发原因 / 下一停点预告 / 预置概况
+  if (st.tripped) {
+    bar.hidden = false;
+    bar.className = 'room-stops is-tripped';
+    bar.innerHTML =
+      `<span class="rp-title">⏸ 讨论停点已触发</span>${esc(st.tripped.reason_text)}` +
+      `<br>停点时码 <b>${fmt(st.tripped.time)}</b> s（按播放将继续，越过该停点）`;
+  } else if (points.length > 0) {
+    bar.hidden = false;
+    bar.className = 'room-stops is-armed';
+    const list = points.map((t) => `${fmt(t)}s`).join('、');
+    bar.innerHTML =
+      `<span class="rp-title">📌 讨论停点：已预置 ${points.length} 个</span>${esc(list)}` +
+      (st.next
+        ? `<br>下一停点 <b>${fmt(st.next.time)}</b> s（约 ${fmt(st.next.seconds_ahead)} 秒后）：连续经过即自动暂停。`
+        : '<br>当前时码之后没有更多停点。');
+  } else {
+    bar.hidden = false;
+    bar.className = 'room-stops is-off';
+    bar.innerHTML =
+      '<span class="rp-title">讨论停点：未预置</span>主持人可在下方「讨论停点」卡预置时码，播放经过即自动暂停讨论。';
+  }
+
+  // 停点卡：主持人编辑器 / 观看者只读
+  $('room-stops-host').hidden = !isHost;
+  $('room-stops-viewer').hidden = isHost;
+  $('room-stops-current').textContent = points.length
+    ? points.map((t) => `${fmt(t)} s`).join('、')
+    : '无';
+  // 输入框未被编辑（未聚焦）时同步服务端最新停点组，避免打断主持人正在输入的内容
+  const input = $('room-stops-input');
+  if (isHost && document.activeElement !== input) {
+    input.value = points.join(' ');
+  }
+}
+
+// 解析停点输入：逗号/空白分隔的非负时码列表；返回 { stops } 或 { error }
+function parseStopsInput(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return { stops: [] }; // 空组 = 清除全部停点
+  const parts = text.split(/[\s,，、]+/).filter((p) => p !== '');
+  const stops = [];
+  for (const p of parts) {
+    const t = Number(p);
+    if (!Number.isFinite(t)) return { error: `停点时码无效：${p}（须为数字秒数）` };
+    if (t < 0) return { error: `停点时码无效：${p}（不得为负）` };
+    stops.push(t);
+  }
+  return { stops };
+}
+
+// 提交停点组（整组替换；空组 = 清除）：携带控制密钥与当前修订号
+async function submitRoomStops(stops) {
+  const r = state.room;
+  if (!r) return;
+  if (!r.key) return showErr($('room-stops-error'), '观看者不能维护停点：请先输入控制密钥。');
+  clearErr($('room-stops-error'));
+  try {
+    const view = await api('PUT', `/api/rooms/${encodeURIComponent(r.view.code)}/stops`, {
+      control_key: r.key,
+      revision: r.view.revision,
+      stops,
+    });
+    r.view = view;
+    applyRoomAnchor(view);
+    renderRoomRole();
+    renderRoomProtection();
+    renderRoomHandover();
+    renderRoomProgram();
+    renderRoomStops();
+  } catch (e) {
+    if (e.status === 409) await pollRoom();
+    else if (e.status === 403) {
+      // 密钥已失效（主持权已交给他人）：本浏览器降级为观看者
+      r.key = null;
+      saveRoomKey(r.view.code, null);
+      $('room-key-input').value = '';
+      await pollRoom();
+      renderRoomRole();
+    }
+    renderRoomStops();
+    showErr($('room-stops-error'), `保存停点失败：${e.message}`);
+  }
+}
+
+$('btn-room-stops-submit').addEventListener('click', () => {
+  const r = state.room;
+  if (!r) return;
+  const parsed = parseStopsInput($('room-stops-input').value);
+  if (parsed.error) return showErr($('room-stops-error'), parsed.error);
+  const stops = parsed.stops;
+  for (const t of stops) {
+    if (t > r.view.duration) {
+      return showErr($('room-stops-error'), `停点时码 ${fmt(t)} 超过版本末尾 ${fmt(r.view.duration)} 秒。`);
+    }
+  }
+  const sorted = [...stops].sort((a, b) => a - b);
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i] === sorted[i - 1]) {
+      return showErr($('room-stops-error'), `停点时码重复：${fmt(sorted[i])}（一组停点内的时码不得重复）。`);
+    }
+  }
+  submitRoomStops(stops);
+});
+
+$('btn-room-stops-clear').addEventListener('click', () => {
+  const r = state.room;
+  if (!r) return;
+  if (!r.key) return showErr($('room-stops-error'), '观看者不能维护停点。');
+  if (!(r.view.stops && r.view.stops.points && r.view.stops.points.length)) {
+    return showErr($('room-stops-error'), '当前没有已预置的停点。');
+  }
+  submitRoomStops([]);
+});
 
 /* --------------------------- 主持权交接 --------------------------- */
 // 当前主持人可发起交接：取得仅显示一次、五分钟有效的一次性凭证；同一房间同时
