@@ -690,6 +690,9 @@ async function enterRoom(code, key, initialView) {
 
   // 重置编排编辑器：进入新房间时强制按本房间草稿重建表格
   $('room-program-table').querySelector('tbody').dataset.rows = '';
+  // 用房间已有停点预填主持人输入框（轮询不覆盖，避免打断正在编辑的草稿）
+  $('room-stops-input').value = view.stops ? view.stops.times.join(', ') : '';
+  clearErr($('room-stops-error'));
 
   $('room-lobby').hidden = true;
   $('room-workspace').hidden = false;
@@ -707,6 +710,7 @@ async function enterRoom(code, key, initialView) {
   renderRoomProtection();
   renderRoomHandover();
   renderRoomProgram();
+  renderRoomStops();
 
   document.querySelector('.tab[data-tab="room"]').click();
 }
@@ -723,9 +727,30 @@ function applyRoomAnchor(view) {
 
 // 循环排演：把“线性目标时码”映射为编排中的真实演出时码（与服务端同一份纯函数）。
 // 观看端只拿到最近一次同步的段/轮/时码锚点；本地用墙钟外推。
+// 停点/超载边界在两个同步点之间同样不越过（服务端下一次轮询会纠正为自动暂停）。
+function roomNextEventBefore(view, fromT, toT) {
+  const p = view.protection;
+  const guardStart = p && p.enabled && p.configured && p.next_trip &&
+    p.next_trip.time >= fromT - 1e-7 && p.next_trip.time <= toT + 1e-7
+    ? p.next_trip.time
+    : null;
+  const times = (view.stops && view.stops.times) || [];
+  let stopAt = null;
+  for (const s of times) {
+    if (s <= fromT + 1e-7) continue;
+    if (s <= toT + 1e-7) { stopAt = s; break; }
+  }
+  // 同一时码优先超载：仅停点严格更早时停点抢先
+  if (guardStart !== null && (stopAt === null || guardStart <= stopAt + 1e-7)) {
+    return { start: guardStart, kind: 'boundary' };
+  }
+  return stopAt === null ? null : { start: stopAt, kind: 'stop' };
+}
+
 function roomProgramProjection(view, targetLinear) {
   const p = view.program;
   if (!p || p.finished) return { time: view.server_time, segIndex: p ? p.segment_index - 1 : 0, iteration: p ? p.loop - 1 : 0, finished: !!p };
+  const findEvent = (segIndex, fromT, toT) => roomNextEventBefore(view, fromT, toT);
   const r = window.LightingProgram.advanceProgram(
     {
       segIndex: p.segment_index - 1,
@@ -735,7 +760,7 @@ function roomProgramProjection(view, targetLinear) {
     },
     p.segments,
     targetLinear,
-    null
+    findEvent
   );
   return { time: r.time, segIndex: r.segIndex, iteration: r.iteration, finished: r.finished };
 }
@@ -749,17 +774,13 @@ function roomCurrentTime(nowSec) {
   if (r.view.program && !r.view.program.finished) {
     // 循环排演：线性目标 -> 段/轮/时码映射
     const proj = roomProgramProjection(r.view, linear);
-    let t = proj.time;
-    // 超载保护：本地外推同样不越过前方首个超载边界（下次轮询由服务端纠正）
-    const p = r.view.protection;
-    if (p && p.enabled && p.next_trip && t > p.next_trip.time) t = p.next_trip.time;
-    return t;
+    return proj.time;
   }
   let t = Math.min(linear, r.view.duration);
-  // 超载保护：即使观看端轮询间隔较长，两次同步之间也不越过前方首个超载边界
-  // （服务端会在该边界自动暂停，下一次轮询即把锚点校正为暂停在边界）
-  const p = r.view.protection;
-  if (p && p.enabled && p.next_trip && t > p.next_trip.time) t = p.next_trip.time;
+  // 停点/超载保护：即使观看端轮询间隔较长，两次同步之间也不越过前方首个停点/
+  // 超载边界（服务端会在该点自动暂停，下一次轮询即把锚点校正为暂停在该点）
+  const ev = roomNextEventBefore(r.view, a.time, t);
+  if (ev) t = Math.min(t, ev.start);
   return t;
 }
 
@@ -794,6 +815,7 @@ async function pollRoom() {
     renderRoomProtection();
     renderRoomHandover();
     renderRoomProgram();
+    renderRoomStops();
     updateRoomHandoverCountdown();
   } catch {
     /* 单次轮询失败不打断观看：下一周期重试 */
@@ -820,6 +842,7 @@ $('btn-room-apply-key').addEventListener('click', () => {
   saveRoomKey(r.view.code, key);
   clearErr($('room-error'));
   renderRoomRole();
+  renderRoomStops();
 });
 
 // 统一控制入口：携带当前修订号；服务端响应即新锚点。409 冲突时先校时再提示重试
@@ -842,6 +865,7 @@ async function roomControl(action, extra = {}) {
     renderRoomProtection();
     renderRoomHandover();
     renderRoomProgram();
+    renderRoomStops();
   } catch (err2) {
     if (err2.status === 409) {
       await pollRoom(); // 过期：按服务端最新状态校时后提示重试
@@ -857,6 +881,7 @@ async function roomControl(action, extra = {}) {
     renderRoomRole();
     renderRoomHandover();
     renderRoomProgram();
+    renderRoomStops();
     showErr($('room-error'), `控制失败：${err2.message}`);
   }
 }
@@ -1074,6 +1099,7 @@ $('btn-room-prog-submit').addEventListener('click', async () => {
     renderRoomProtection();
     renderRoomHandover();
     renderRoomProgram();
+    renderRoomStops();
   } catch (e) {
     if (e.status === 409) await pollRoom();
     else if (e.status === 403) {
@@ -1084,6 +1110,7 @@ $('btn-room-prog-submit').addEventListener('click', async () => {
       renderRoomRole();
     }
     renderRoomProgram();
+    renderRoomStops();
     showErr($('room-program-error'), `提交循环排演失败：${e.message}`);
   }
 });
@@ -1106,6 +1133,7 @@ $('btn-room-prog-cancel').addEventListener('click', async () => {
     renderRoomProtection();
     renderRoomHandover();
     renderRoomProgram();
+    renderRoomStops();
   } catch (e) {
     if (e.status === 409) await pollRoom();
     renderRoomProgram();
@@ -1113,6 +1141,107 @@ $('btn-room-prog-cancel').addEventListener('click', async () => {
   }
 });
 
+/* --------------------------- 讨论停点 --------------------------- */
+// 主持人整组维护停点（{times:[...]}，携带密钥与修订号；空数组清除）；播放连续
+// 经过停点自动暂停、不加修订号，继续播放越过本停点，循环排演再次经过仍暂停。
+// 观看者只读查看停点列表与触发状态。停点不随手动跳转/编排交接变化。
+
+// 停点状态条：无停点 / 已预置（列出时码与下一个）/ 已触发自动暂停
+function renderRoomStops() {
+  const r = state.room;
+  if (!r) return;
+  const isHost = !!r.key;
+  $('room-stops-host').hidden = !isHost;
+  $('room-stops-viewer').hidden = isHost;
+
+  const box = $('room-stops-status');
+  const s = r.view.stops || { times: [] };
+  const t = roomCurrentTime(Date.now() / 1000);
+  let cls = 'is-safe';
+  let html;
+  if (s.tripped) {
+    cls = 'is-tripped';
+    html = '<span class="rp-title">⏸ 讨论停点已触发</span>' + esc(s.tripped.reason_text) +
+      `<br>已暂停在演出时码 <b>${fmt(s.tripped.time)}</b> s（继续播放越过本停点后，下一个停点照常生效）`;
+  } else if (s.times.length === 0) {
+    cls = 'is-off';
+    html = '<span class="rp-title">讨论停点：未设置</span>当前没有预置停点，播放按原规则进行；主持人可在下方整组设置。';
+  } else {
+    const list = s.times
+      .map((x) => `<span class="room-stop-chip${Math.abs(x - t) <= 0.05 ? ' cur' : ''}">${fmt(x)} s</span>`)
+      .join(' ');
+    const ahead = s.next_stop
+      ? `下一个停点 <b>${fmt(s.next_stop.time)}</b> s（约 ${fmt(s.next_stop.seconds_ahead)} 秒后到达）`
+      : '前方时程内已没有停点（继续越过末尾后从头播放时停点仍会生效）';
+    html = `<span class="rp-title">讨论停点：已预置 ${s.times.length} 个</span>${ahead}：` +
+      `<span class="room-stop-list">${list}</span>`;
+  }
+  box.className = `room-protection ${cls}`;
+  box.innerHTML = html;
+}
+
+// 解析输入框：逗号/中文逗号/空白分隔；返回数组或错误字符串
+function parseStopInput(raw) {
+  const parts = raw.split(/[\s,，、;；]+/).filter((x) => x !== '');
+  if (parts.length === 0) return { times: [] };
+  const times = [];
+  for (const p of parts) {
+    const n = Number(p);
+    if (!Number.isFinite(n) || n < 0) return { error: `非法时码：${p}（须为非负数字秒数）` };
+    times.push(n);
+  }
+  return { times };
+}
+
+async function saveRoomStops(times) {
+  const r = state.room;
+  if (!r || !r.key) {
+    return showErr($('room-stops-error'), '观看者不能维护停点：请先输入控制密钥。');
+  }
+  clearErr($('room-stops-error'));
+  for (let i = 0; i < times.length; i++) {
+    if (times[i] > r.view.duration) {
+      return showErr($('room-stops-error'), `第 ${i + 1} 个停点 ${fmt(times[i])} 超过版本末尾 ${fmt(r.view.duration)} 秒。`);
+    }
+  }
+  try {
+    const view = await api('POST', `/api/rooms/${encodeURIComponent(r.view.code)}/stops`, {
+      control_key: r.key,
+      revision: r.view.revision,
+      times,
+    });
+    r.view = view;
+    applyRoomAnchor(view);
+    $('room-stops-input').value = view.stops.times.join(', ');
+    renderRoomRole();
+    renderRoomProtection();
+    renderRoomHandover();
+    renderRoomProgram();
+    renderRoomStops();
+  } catch (e) {
+    if (e.status === 409) {
+      await pollRoom();
+    } else if (e.status === 403) {
+      r.key = null;
+      saveRoomKey(r.view.code, null);
+      $('room-key-input').value = '';
+      await pollRoom();
+      renderRoomRole();
+    }
+    renderRoomStops();
+    showErr($('room-stops-error'), `保存讨论停点失败：${e.message}`);
+  }
+}
+
+$('btn-room-stops-save').addEventListener('click', () => {
+  const parsed = parseStopInput($('room-stops-input').value);
+  if (parsed.error) return showErr($('room-stops-error'), parsed.error);
+  saveRoomStops(parsed.times);
+});
+
+$('btn-room-stops-clear').addEventListener('click', () => {
+  saveRoomStops([]);
+});
 
 // 回路超载保护状态条：未启用 / 已启用安全 / 当前已超载 / 已在边界自动暂停
 function renderRoomProtection() {
@@ -1220,6 +1349,7 @@ async function claimRoomHandover(token) {
     $('room-key-input').value = d.control_key;
     renderRoomRole();
     renderRoomHandover();
+    renderRoomStops();
   } catch (err2) {
     if (err2.status === 409) await pollRoom();
     showErr($('room-error'), `领取失败：${err2.message}`);

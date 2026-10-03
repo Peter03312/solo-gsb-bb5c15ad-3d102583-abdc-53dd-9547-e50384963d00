@@ -173,6 +173,32 @@
 
 调用示例见下文「主持权交接 HTTP API」。
 
+## 共享房间讨论停点（预置讨论暂停点）
+
+主持人可在房间的**固定演出版本**上预置一组讨论停点，播放到点自动暂停供现场讨论：
+
+- **整组替换**：一次提交一组**互不重复的非负演出时码**（秒，可小数），均**不超过版本末尾**；
+  提交携带当前**控制密钥**与**房间修订号**，整组校验通过后**原子替换**原停点；
+  **空数组 `[]` 表示清除全部停点**。
+- **无权 / 过期 / 非法都不改房间**：缺少或错误密钥 → **403**；过期修订号 → **409**；
+  `times` 非数组、某项为负数/非数字/超过末尾、组内时码重复 → **400**，整次提交不落库。
+  成功替换房间修订号 **+1**（与成功控制同一口径，已发出的**交接凭证随之作废**）。
+- **播放按服务端墙钟连续经过即暂停**：播放惰性推算时，一旦**连续向上经过**任一停点，
+  就**准确暂停在该时码**并返回触发原因（`stops.tripped`，中文说明）；自动暂停
+  **不增加控制修订号**、惰性落库——页面**刷新、服务重启、观看者重连后状态一致**。
+- **继续播放须越过刚触发的停点**：从停点自动暂停处按播放，立即越过本停点（不会原地
+  再触发），到**前方下一个停点**才再次暂停。
+- **循环排演每次重新经过仍暂停**：段尾瞬时跳回/跳段后再次连续经过同一停点仍会暂停；
+  **段尾瞬时跳转不触发被跳过的停点**（只有真正连续播放经过的时码才触发）。
+- **手动跳转沿用取消编排规则**：`seek` 仍然取消当前循环排演；**跳到停点时码上不立即
+  触发**，须之后播放连续经过才触发。停点配置**不随**手动跳转/编排/取消编排/**交接**变化。
+- **与超载保护的先后**：停点与超载区间左边界按**先抵达者**生效；**同一时码优先超载**
+  （返回 `protection.tripped`，不重复报告停点触发）。
+- **观看者只读**：房间状态的 `stops` 字段持续报告停点列表、前方下一个停点（`next_stop`）
+  与已触发时的 `tripped`；观看者可见状态但维护停点得到 **403**。
+
+调用示例见下文「讨论停点 HTTP API」。
+
 ## 共享房间循环排演（1～8 段循环）
 
 当前主持人可在房间的**固定演出版本**上编排一次循环排演，用于反复打磨某几段演出：
@@ -1079,6 +1105,79 @@ curl -X POST http://localhost:3000/api/rooms/K7P2QX/program/clear \
 `server_wall/server_time/playing/speed` 仍是校时锚点，页面用与服务端相同的段/轮映射外推，
 每秒轮询纠正。
 
+## 讨论停点 HTTP API
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/rooms/:code/stops` | 主持人原子替换讨论停点 `{control_key, revision, times}`：互不重复的非负时码、不超过版本末尾；空数组清除；成功修订号 +1，返回最新房间状态（含 `stops`） |
+
+`GET /api/rooms/:code`（以及创建/控制/编排/交接的成功响应）始终带 `stops` 状态块：
+
+```json
+{
+  "stops": {
+    "times": [12, 30.5, 48],
+    "configured": true,
+    "next_stop": { "time": 30.5, "seconds_ahead": 18.5 },
+    "tripped": null
+  }
+}
+```
+
+- `times`：当前停点时码升序列表（无停点为 `[]`，`configured=false`，`next_stop=null`）；
+- `next_stop`：当前时码前方下一个停点与剩余秒数（停在刚触发的停点上时不再预告它）；
+- `tripped`：播放连续经过停点自动暂停时为 `{reason:"stop_point", reason_text, time}`，
+  否则为 `null`；自动暂停不增加修订号，继续播放/手动跳转后清除。
+
+### 1) 设置 / 替换停点（持密钥者）
+
+```bash
+# 在修订号 2 上整组预置三个停点（顺序无所谓，服务端校验后按升序保存）
+curl -X POST http://localhost:3000/api/rooms/K7P2QX/stops \
+  -H 'Content-Type: application/json' \
+  -d '{"control_key":"d4e63d64…","revision":2,"times":[48,12,30.5]}'
+# 200：返回最新房间状态，stops.times=[12,30.5,48]，revision=3
+```
+
+非法情形均**不改变房间**：
+
+```bash
+# 负数 / 非数字 / 超过版本末尾 / 组内重复 → 400
+curl -X POST http://localhost:3000/api/rooms/K7P2QX/stops \
+  -H 'Content-Type: application/json' \
+  -d '{"control_key":"d4e63d64…","revision":3,"times":[12,-4]}'
+# {"error":"第 2 个停点非法：-4（须为非负数字秒数）"}
+
+# 缺少/错误密钥 → 403；过期修订号 → 409（与 /control 同一口径）
+```
+
+### 2) 清除全部停点（空组）
+
+```bash
+curl -X POST http://localhost:3000/api/rooms/K7P2QX/stops \
+  -H 'Content-Type: application/json' \
+  -d '{"control_key":"d4e63d64…","revision":3,"times":[]}'
+# 200：stops.times=[]、configured=false，revision=4
+```
+
+### 3) 播放触发与越过
+
+```bash
+# 播放连续经过 12 秒：GET（惰性落库）返回 playing=false、time=12、revision 不增加，
+# stops.tripped={reason:"stop_point",time:12,...}
+curl http://localhost:3000/api/rooms/K7P2QX
+
+# 继续播放（修订号仍为 4）：越过 12，到 30.5 才再次暂停
+curl -X POST http://localhost:3000/api/rooms/K7P2QX/control \
+  -H 'Content-Type: application/json' \
+  -d '{"control_key":"d4e63d64…","revision":4,"action":"play"}'
+```
+
+- 循环排演中每次重新经过同一停点仍暂停；段尾瞬时跳回/跳段不触发被跳过的停点；
+- 手动 `seek` 跳到停点不立即触发（仍取消当前编排）；
+- 停点与超载边界同时码时**超载优先**（响应给 `protection.tripped`）；先抵达者先生效；
+- 观看者调用替换接口返回 403，只读 `stops` 状态块。
+
 ## HTTP API 摘要
 
 | 方法 | 路径 | 说明 |
@@ -1109,12 +1208,13 @@ curl -X POST http://localhost:3000/api/rooms/K7P2QX/program/clear \
 | POST | `/api/merge/preview` | 草稿三方合并预览（共同基线 + 待合入版本），只读，返回令牌/自动改动/冲突两侧值 |
 | POST | `/api/merge/commit` | 凭预览令牌与逐项抉择提交，一次事务更新灯具/回路/接线/Cue |
 | POST | `/api/rooms` | 基于已发布版本创建共享房间（`overload_protection` 可选启用回路超载保护），返回房间码与一次性控制密钥 |
-| GET | `/api/rooms/:code` | 凭房间码查看房间状态（播放/暂停、服务端推算时码、速度、修订号、`protection` 保护/触发状态、`handover` 交接状态、`program` 循环排演段/轮次/状态），无需密钥 |
+| GET | `/api/rooms/:code` | 凭房间码查看房间状态（播放/暂停、服务端推算时码、速度、修订号、`protection` 保护/触发状态、`handover` 交接状态、`program` 循环排演段/轮次/状态、`stops` 讨论停点/触发状态），无需密钥 |
 | POST | `/api/rooms/:code/control` | 持密钥播放/暂停/跳转/设置速度（携带修订号，过期 409；保护房间当前/目标时码超载 400 且不改房间；成功控制使已发出的交接凭证作废） |
 | POST | `/api/rooms/:code/handover/issue` | 当前主持人凭控制密钥与修订号发起交接，返回仅显示一次、五分钟有效的一次性交接凭证（再次发起旧凭证失效） |
 | POST | `/api/rooms/:code/handover/claim` | 接班人凭房间码与交接凭证领取新控制密钥：领取与修订号 +1 原子完成、旧密钥即刻失效、并发至多一人成功、重试不回显新密钥；过期凭证/错误凭证 403，过期/作废修订号 409，均不改变控制权 |
 | POST | `/api/rooms/:code/program` | 提交 1～8 段循环排演（携带控制密钥与修订号；非负起止、start<end、end≤末尾、正整数重复；超载段起点在保护房间 400 拒绝整次编排），成功后从首段开始、修订号 +1 |
 | POST | `/api/rooms/:code/program/clear` | 取消循环排演（携带控制密钥与修订号）：删除编排、沿用普通房间语义，播放状态与时码保留，修订号 +1 |
+| POST | `/api/rooms/:code/stops` | 主持人原子替换讨论停点（携带控制密钥与修订号；非负、不超过末尾、互不重复；空数组清除；无权 403/过期 409/非法 400 均不改房间），成功修订号 +1；播放连续经过停点自动暂停、不加修订号，同一时码超载优先 |
 
 所有错误返回 `400/403/404/409` 与形如 `{"error": "具体中文原因"}` 的 JSON（`403` 用于共享房间缺少/错误控制密钥）。
 

@@ -136,10 +136,14 @@ CREATE TABLE IF NOT EXISTS rooms (
   -- 回路超载保护：创建时可选启用；启用后只按固定版本快照内的回路容量与灯具接线判定
   -- （1 启用 / 0 未启用，未启用的房间完全沿用原行为）
   overload_protection INTEGER NOT NULL DEFAULT 0,
-  -- 保护自动暂停时固化的触发回路（快照回路编号）与触发时码；非自动暂停状态为 NULL。
+  -- 保护/停点自动暂停时固化的触发回路（快照回路编号）与触发时码；非保护触发状态为 NULL。
   -- 惰性落库与末尾停住一样不增加控制修订号；服务重启后据此恢复保护状态。
   tripped_circuit_id INTEGER,
   tripped_time       REAL,
+  -- 讨论停点自动暂停时固化的触发时码；tripped_reason 区分自动暂停原因
+  -- （'overload_boundary' 超载边界 / 'stop_point' 讨论停点），非自动暂停状态为 NULL。
+  tripped_stop_time  REAL,
+  tripped_reason     TEXT,
   created_at  REAL NOT NULL
 );
 
@@ -173,6 +177,16 @@ CREATE TABLE IF NOT EXISTS room_programs (
   prog_time  REAL NOT NULL DEFAULT 0,        -- 当前段内（或段起点）演出时码
   finished   INTEGER NOT NULL DEFAULT 0      -- 1 = 整次编排已全部走完，停在末段终点
 );
+
+-- 共享房间讨论停点：主持人凭控制密钥与房间修订号原子替换整组停点。
+-- times 为 JSON 数字数组（互不重复的非负演出时码，均不超过房间固定版本末尾，
+-- 提交时已排序校验）；行不存在（含从未设置、空组清除）= 无停点房间，沿用原行为。
+-- 播放按服务端墙钟连续向上经过任一停点时自动暂停并显示原因（惰性落库、不加修订号）。
+-- 行只保存配置；自动暂停状态固化在 rooms.tripped_stop_time / tripped_reason。
+CREATE TABLE IF NOT EXISTS room_stops (
+  room_id    INTEGER PRIMARY KEY REFERENCES rooms(id) ON DELETE CASCADE,
+  times      TEXT NOT NULL                   -- JSON：[time,...]，非空数组（空组直接删行）
+);
 `;
 
 let db;
@@ -198,6 +212,12 @@ function migrate(database) {
     }
     if (!roomCols.includes('tripped_time')) {
       database.exec('ALTER TABLE rooms ADD COLUMN tripped_time REAL');
+    }
+    if (!roomCols.includes('tripped_stop_time')) {
+      database.exec('ALTER TABLE rooms ADD COLUMN tripped_stop_time REAL');
+    }
+    if (!roomCols.includes('tripped_reason')) {
+      database.exec('ALTER TABLE rooms ADD COLUMN tripped_reason TEXT');
     }
   }
 }

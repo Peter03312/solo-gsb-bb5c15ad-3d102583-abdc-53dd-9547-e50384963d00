@@ -273,6 +273,18 @@ tr.cmp-hot td { color: var(--amber-soft); }
 .room-protection.is-warn { color: var(--danger); border-color: var(--danger); background: rgba(255, 107, 107, 0.10); }
 .room-protection.is-tripped { color: var(--amber-soft); border-color: var(--amber); background: rgba(245, 185, 66, 0.12); }
 
+/* 讨论停点状态条中的时码小徽标 */
+.room-stop-list { display: inline-flex; flex-wrap: wrap; gap: .35rem; margin-left: .25rem; }
+.room-stop-chip {
+  display: inline-block;
+  padding: .05rem .5rem;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.room-stop-chip.cur { background: rgba(245, 185, 66, 0.22); color: var(--amber-soft); font-weight: 700; }
+
 /* 房间内的主持权交接状态条 */
 .room-handover {
   margin: .5rem 0;

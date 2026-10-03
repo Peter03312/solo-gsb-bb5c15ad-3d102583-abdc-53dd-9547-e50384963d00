@@ -1539,6 +1539,32 @@ function getRoomProgram(roomId) {
   return { ...p, segments, finished: !!p.finished };
 }
 
+// 读取房间讨论停点：不存在/空组 = 无停点；返回升序时码数组（写入时已排序去重）
+function getRoomStops(roomId) {
+  const row = db.prepare('SELECT times FROM room_stops WHERE room_id = ?').get(roomId);
+  if (!row) return [];
+  try {
+    const times = JSON.parse(row.times);
+    return Array.isArray(times) ? times : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 播放从锚点时码 fromTime 连续向上推进到 t 时撞上的首个讨论停点。
+ * 停点只在“连续经过”时触发：锚点本身（含暂停在刚触发的停点上）不算，
+ * 必须严格位于锚点前方且已被抵达（t >= s）。段尾瞬时跳转落点之间未连续
+ * 经过的时码由调用方分段调用本函数，故不会误触发被跳过的停点。
+ */
+function nextStopBetween(stops, fromTime, t) {
+  for (const s of stops) {
+    if (s <= fromTime + ROOM_EPS) continue; // 锚点及身后：不触发
+    if (s <= t + ROOM_EPS) return s; // 前方停点：已抵达
+  }
+  return null;
+}
+
 /**
  * 读取房间当前状态：服务端按墙钟推算时码。
  * 播放中按 time + (now - anchor_wall) * speed 推算；到末尾则自动停住并惰性落库
@@ -1551,13 +1577,20 @@ function getRoomProgram(roomId) {
  * 按段尾跳回/跳段规则把它映射到真实演出时码；段尾跳跃不耗墙钟。整次编排走完
  * 停在末段终点（惰性落库 finished=1，不改修订号）；编排进行中抵达超载边界同样
  * 自动暂停（不越过危险段、不加修订号）。
+ *
+ * 讨论停点（stops 非空）：播放连续向上经过任一停点即在该时码自动暂停并惰性落库
+ * （不改修订号），返回 stopHit 时码。停点与超载边界同时码时超载优先（同一时码
+ * 优先超载）；段尾瞬时跳回/跳段不经过的时码不会触发；编排循环再次经过同一停点
+ * 仍会暂停。
  */
-function computeRoomState(row, { now = Date.now() / 1000, persistStopped = false, guard = null, prog = undefined } = {}) {
+function computeRoomState(row, { now = Date.now() / 1000, persistStopped = false, guard = null, prog = undefined, stops = undefined } = {}) {
   if (prog === undefined) prog = getRoomProgram(row.id);
+  if (stops === undefined) stops = getRoomStops(row.id);
   let playing = !!row.playing;
   let time = row.time;
   let ended = false;
   let trip = null;
+  let stopHit = null;
   const progState = prog
     ? { segIndex: prog.seg_index, iteration: prog.iteration, time: prog.prog_time, finished: !!prog.finished }
     : null;
@@ -1566,12 +1599,21 @@ function computeRoomState(row, { now = Date.now() / 1000, persistStopped = false
     const elapsed = Math.max(0, now - row.anchor_wall) * row.speed;
 
     if (prog && !prog.finished) {
-      // 编排播放：墙钟目标 -> 段/轮/时码映射；findTrip 与普通房间同一套超载边界
-      const findTrip = guard
-        ? (segIndex, fromT, toT) =>
-            guard.boundaries.find((b) => b.start >= fromT - ROOM_EPS && b.start <= toT + ROOM_EPS) || null
-        : null;
-      const r = Program.advanceProgram(progState, prog.segments, progState.time + elapsed, findTrip);
+      // 编排播放：墙钟目标 -> 段/轮/时码映射；段尾瞬时跳跃落点之间不连续经过，
+      // 引擎对每个连续段分别回调，故跳过段内的超载边界/停点都不会误触发
+      const findEvent = (segIndex, fromT, toT) => {
+        if (guard) {
+          const b = guard.boundaries.find((x) => x.start >= fromT - ROOM_EPS && x.start <= toT + ROOM_EPS);
+          // 同一时码优先超载：仅当停点严格更早（超过容差）时才由停点抢先
+          const s = nextStopBetween(stops, fromT, toT);
+          if (b && (s === null || b.start <= s + ROOM_EPS)) return { start: b.start, kind: 'boundary', boundary: b };
+          if (s !== null) return { start: s, kind: 'stop' };
+          return null;
+        }
+        const s = nextStopBetween(stops, fromT, toT);
+        return s === null ? null : { start: s, kind: 'stop' };
+      };
+      const r = Program.advanceProgram(progState, prog.segments, progState.time + elapsed, findEvent);
       time = r.time;
       progState.segIndex = r.segIndex;
       progState.iteration = r.iteration;
@@ -1579,7 +1621,11 @@ function computeRoomState(row, { now = Date.now() / 1000, persistStopped = false
       progState.finished = r.finished;
       if (r.boundary) {
         playing = false;
-        trip = { circuit_id: r.boundary.circuit.id, time: r.boundary.start };
+        if (r.boundary.kind === 'stop') {
+          stopHit = r.boundary.start;
+        } else {
+          trip = { circuit_id: r.boundary.boundary.circuit.id, time: r.boundary.start };
+        }
       } else if (r.finished) {
         playing = false;
         ended = true;
@@ -1590,7 +1636,8 @@ function computeRoomState(row, { now = Date.now() / 1000, persistStopped = false
           const lastSeg = prog.segments[prog.segments.length - 1];
           db.prepare(
             `UPDATE rooms SET playing = 0, time = ?, anchor_wall = ?,
-                             tripped_circuit_id = NULL, tripped_time = NULL WHERE id = ?`
+                             tripped_circuit_id = NULL, tripped_time = NULL,
+                             tripped_stop_time = NULL, tripped_reason = NULL WHERE id = ?`
           ).run(lastSeg.end, now, row.id);
           db.prepare(
             `UPDATE room_programs SET seg_index = ?, iteration = ?, prog_time = ?, finished = 1 WHERE room_id = ?`
@@ -1599,24 +1646,39 @@ function computeRoomState(row, { now = Date.now() / 1000, persistStopped = false
           // 自动暂停：固化在超载区间左边界；不增加控制修订号
           db.prepare(
             `UPDATE rooms SET playing = 0, time = ?, anchor_wall = ?,
-                             tripped_circuit_id = ?, tripped_time = ? WHERE id = ?`
-          ).run(trip.time, now, trip.circuit_id, trip.time, row.id);
+                             tripped_circuit_id = ?, tripped_time = ?,
+                             tripped_stop_time = NULL, tripped_reason = ? WHERE id = ?`
+          ).run(trip.time, now, trip.circuit_id, trip.time, 'overload_boundary', row.id);
           db.prepare(
             `UPDATE room_programs SET seg_index = ?, iteration = ?, prog_time = ? WHERE room_id = ?`
           ).run(progState.segIndex, progState.iteration, trip.time, row.id);
+        } else if (stopHit !== null) {
+          // 讨论停点自动暂停：固化在停点时码；不增加控制修订号
+          db.prepare(
+            `UPDATE rooms SET playing = 0, time = ?, anchor_wall = ?,
+                             tripped_circuit_id = NULL, tripped_time = NULL,
+                             tripped_stop_time = ?, tripped_reason = ? WHERE id = ?`
+          ).run(stopHit, now, stopHit, 'stop_point', row.id);
+          db.prepare(
+            `UPDATE room_programs SET seg_index = ?, iteration = ?, prog_time = ? WHERE room_id = ?`
+          ).run(progState.segIndex, progState.iteration, stopHit, row.id);
         }
       }
     } else {
       let t = row.time + elapsed;
 
-      // 超载保护先于末尾判定：边界一定不晚于版本末尾
-      if (guard) {
-        const hit = tripBoundaryBetween(guard, row.time, t);
-        if (hit) {
-          t = hit.start;
-          playing = false;
-          trip = { circuit_id: hit.circuit.id, time: hit.start };
-        }
+      // 连续向上经过的首个事件：超载边界优先于同时码停点；两者都先于版本末尾
+      const guardHit = guard ? tripBoundaryBetween(guard, row.time, t) : null;
+      const stopAt = nextStopBetween(stops, row.time, t);
+      const stopWins = stopAt !== null && (!guardHit || stopAt < guardHit.start - ROOM_EPS);
+      if (guardHit && !stopWins) {
+        t = guardHit.start;
+        playing = false;
+        trip = { circuit_id: guardHit.circuit.id, time: guardHit.start };
+      } else if (stopWins) {
+        t = stopAt;
+        playing = false;
+        stopHit = stopAt;
       }
 
       if (playing && t >= row.duration) {
@@ -1629,14 +1691,23 @@ function computeRoomState(row, { now = Date.now() / 1000, persistStopped = false
         if (ended) {
           db.prepare(
             `UPDATE rooms SET playing = 0, time = duration, anchor_wall = ?,
-                             tripped_circuit_id = NULL, tripped_time = NULL WHERE id = ?`
+                             tripped_circuit_id = NULL, tripped_time = NULL,
+                             tripped_stop_time = NULL, tripped_reason = NULL WHERE id = ?`
           ).run(now, row.id);
         } else if (trip) {
           // 自动暂停：固化在超载区间左边界；不增加控制修订号
           db.prepare(
             `UPDATE rooms SET playing = 0, time = ?, anchor_wall = ?,
-                             tripped_circuit_id = ?, tripped_time = ? WHERE id = ?`
-          ).run(trip.time, now, trip.circuit_id, trip.time, row.id);
+                             tripped_circuit_id = ?, tripped_time = ?,
+                             tripped_stop_time = NULL, tripped_reason = ? WHERE id = ?`
+          ).run(trip.time, now, trip.circuit_id, trip.time, 'overload_boundary', row.id);
+        } else if (stopHit !== null) {
+          // 讨论停点自动暂停：固化在停点时码；不增加控制修订号
+          db.prepare(
+            `UPDATE rooms SET playing = 0, time = ?, anchor_wall = ?,
+                             tripped_circuit_id = NULL, tripped_time = NULL,
+                             tripped_stop_time = ?, tripped_reason = ? WHERE id = ?`
+          ).run(stopHit, now, stopHit, 'stop_point', row.id);
         }
       }
       time = t;
@@ -1650,6 +1721,7 @@ function computeRoomState(row, { now = Date.now() / 1000, persistStopped = false
     revision: row.revision,
     ended,
     trip,
+    stopHit,
     prog: progState,
   };
 }
@@ -1676,8 +1748,8 @@ function buildProtection(row, state, guard) {
     }
   }
 
-  // 自动暂停标记由惰性落库的两列恢复（服务重启后同样有效）
-  if (row.tripped_circuit_id !== null && row.tripped_circuit_id !== undefined) {
+  // 自动暂停标记由惰性落库的列恢复（服务重启后同样有效）；仅超载触发时在此报告
+  if (row.tripped_reason === 'overload_boundary' && row.tripped_circuit_id !== null && row.tripped_circuit_id !== undefined) {
     const c = guard.circuitsById.get(row.tripped_circuit_id);
     block.tripped = {
       reason: 'overload_boundary',
@@ -1743,8 +1815,33 @@ function buildProgramBlock(row, state, prog) {
   return block;
 }
 
+// 讨论停点对外状态块（房间状态/控制/停点替换响应一致；观看者只读可见、无密钥字段）。
+// 所有房间都带 stops 字段（无停点时 times 为空数组，兼容前端统一渲染）。
+function buildStopsBlock(row, state, stops) {
+  const block = {
+    times: stops.map(round6),
+    configured: stops.length > 0,
+  };
+
+  // 已触发（停点自动暂停，惰性落库；继续播放/手动跳转/超载触发后由控制或惰性落库清除）
+  if (row.tripped_reason === 'stop_point' && row.tripped_stop_time !== null && row.tripped_stop_time !== undefined) {
+    block.tripped = {
+      reason: 'stop_point',
+      reason_text:
+        '讨论停点已触发：播放连续经过预置停点，已自动暂停在此供讨论（自动暂停不增加控制修订号）；继续播放须越过本停点，循环排演再次经过仍会暂停',
+      time: round6(row.tripped_stop_time ?? state.time),
+    };
+  }
+
+  // 前方下一个停点（严格位于当前时码前方；停在刚触发的停点上时不再预告它）
+  const next = stops.find((s) => s > state.time + ROOM_EPS) ?? null;
+  block.next_stop =
+    next !== null ? { time: round6(next), seconds_ahead: round6(Math.max(0, next - state.time)) } : null;
+  return block;
+}
+
 // 房间对外视图（创建/查询/控制/交接共用）；state 由 computeRoomState 得到
-function buildRoomView(row, state, now, guard, prog) {
+function buildRoomView(row, state, now, guard, prog, stops) {
   const view = {
     code: row.code,
     label: row.label,
@@ -1755,6 +1852,8 @@ function buildRoomView(row, state, now, guard, prog) {
     speed: state.speed,
     revision: state.revision,
     protection: buildProtection(row, state, guard),
+    // 讨论停点配置与触发/预告状态（主持人可维护，观看者只读查看）
+    stops: buildStopsBlock(row, state, stops === undefined ? getRoomStops(row.id) : stops),
     // 服务端墙钟与对应时码：观看端据此校时（基准时码 + 流逝时间 × 速度）
     server_wall: now,
     server_time: round6(state.time),
@@ -1918,6 +2017,9 @@ app.post('/api/rooms/:code/control', (req, res) => {
     // 写库的自动暂停标记：仅当本次结果确为保护触发的暂停时保留
     let tripCircuit = live.trip ? live.trip.circuit_id : null;
     let tripTime = live.trip ? live.trip.time : null;
+    // 写库的讨论停点自动暂停标记：仅当本次实时推算确实停在停点上时保留
+    let trippedStopTime = live.stopHit !== null ? live.stopHit : null;
+    let trippedReason = live.trip ? 'overload_boundary' : live.stopHit !== null ? 'stop_point' : null;
     // 写库的循环排演逻辑进度（仅 prog 存在时使用）
     let progSeg = live.prog ? live.prog.segIndex : 0;
     let progIter = live.prog ? live.prog.iteration : 0;
@@ -1927,7 +2029,8 @@ app.post('/api/rooms/:code/control', (req, res) => {
     let cancelProgram = false;
 
     if (action === 'play') {
-      if (curProg) {
+      // seek 已在本次控制中取消编排：curProg 是删除前读出的旧行，须按普通房间处理
+      if (curProg && !cancelProgram) {
         if (live.prog.finished) {
           // 整次编排已走完（停在末段终点）：再播放从首段重新开始整次编排
           progSeg = 0;
@@ -1964,15 +2067,21 @@ app.post('/api/rooms/:code/control', (req, res) => {
       playing = true;
       tripCircuit = null;
       tripTime = null;
+      // 继续播放：越过刚触发的停点/超载边界（清除自动暂停标记；停点配置不清除）
+      trippedStopTime = null;
+      trippedReason = null;
     } else if (action === 'pause') {
       playing = false;
-      // 非保护触发的普通暂停清除超载标记
+      // 非保护触发的普通暂停清除全部自动暂停标记
       if (!live.trip) {
         tripCircuit = null;
         tripTime = null;
       }
+      trippedStopTime = null;
+      trippedReason = live.trip ? 'overload_boundary' : null;
     } else if (action === 'seek') {
-      // 手动跳转取消编排并沿用原房间控制语义（跳转后为普通房间）
+      // 手动跳转取消编排并沿用原房间控制语义（跳转后为普通房间）；停点配置保留，
+      // 跳到停点时码上不立即触发（须播放连续向上经过）
       cancelProgram = !!curProg;
       // 播放中跳入超载段：拒绝且房间不变；暂停（含已被保护自动暂停）时允许任意跳转避险
       if (guard && live.playing) {
@@ -1987,12 +2096,14 @@ app.post('/api/rooms/:code/control', (req, res) => {
       }
       time = seekTime;
       if (seekTime >= cur.duration) playing = false; // 跳到末尾即停住
-      // 跳转后人不在触发边界上：清除既有自动暂停标记
+      // 跳转后人不在自动暂停触发点上：清除既有自动暂停标记
       tripCircuit = null;
       tripTime = null;
+      trippedStopTime = null;
+      trippedReason = null;
       // 播放/暂停状态沿用（播放则从新时码起按速度继续；暂停锚住该时码）
     } else {
-      // speed：以当前实时推算时码为新基准（若保护刚把播放截停，则停在边界上），
+      // speed：以当前实时推算时码为新基准（若保护/停点刚把播放截停，则停在触发点），
       // 立刻按新速度继续（暂停则保持暂停）；编排逻辑进度按实时推算固化
       nextSpeed = speed;
       if (curProg) {
@@ -2005,14 +2116,17 @@ app.post('/api/rooms/:code/control', (req, res) => {
         tripCircuit = null;
         tripTime = null;
       }
+      // 停点/超载的自动暂停标记按实时推算结果保留或清除
+      trippedStopTime = live.stopHit !== null ? live.stopHit : null;
+      trippedReason = live.trip ? 'overload_boundary' : live.stopHit !== null ? 'stop_point' : null;
     }
 
     db.prepare(
       `UPDATE rooms
        SET playing = ?, time = ?, anchor_wall = ?, speed = ?, revision = revision + 1,
-           tripped_circuit_id = ?, tripped_time = ?
+           tripped_circuit_id = ?, tripped_time = ?, tripped_stop_time = ?, tripped_reason = ?
        WHERE id = ?`
-    ).run(playing ? 1 : 0, time, anchor, nextSpeed, tripCircuit, tripTime, cur.id);
+    ).run(playing ? 1 : 0, time, anchor, nextSpeed, tripCircuit, tripTime, trippedStopTime, trippedReason, cur.id);
     if (cancelProgram) {
       // 手动跳转：取消编排（行删除后该房间回到未编排语义）
       db.prepare('DELETE FROM room_programs WHERE room_id = ?').run(cur.id);
@@ -2210,7 +2324,8 @@ app.post('/api/rooms/:code/program', (req, res) => {
     db.prepare(
       `UPDATE rooms
        SET playing = 1, time = ?, anchor_wall = ?, speed = speed, revision = revision + 1,
-           tripped_circuit_id = NULL, tripped_time = NULL
+           tripped_circuit_id = NULL, tripped_time = NULL,
+           tripped_stop_time = NULL, tripped_reason = NULL
        WHERE id = ?`
     ).run(segments[0].start, now, cur.id);
     db.prepare(
@@ -2281,9 +2396,18 @@ app.post('/api/rooms/:code/program/clear', (req, res) => {
     db.prepare(
       `UPDATE rooms
        SET playing = ?, time = ?, anchor_wall = ?, revision = revision + 1,
-           tripped_circuit_id = ?, tripped_time = ?
+           tripped_circuit_id = ?, tripped_time = ?, tripped_stop_time = ?, tripped_reason = ?
        WHERE id = ?`
-    ).run(live.playing ? 1 : 0, live.time, now, live.trip ? live.trip.circuit_id : null, live.trip ? live.trip.time : null, cur.id);
+    ).run(
+      live.playing ? 1 : 0,
+      live.time,
+      now,
+      live.trip ? live.trip.circuit_id : null,
+      live.trip ? live.trip.time : null,
+      live.stopHit !== null ? live.stopHit : null,
+      live.trip ? 'overload_boundary' : live.stopHit !== null ? 'stop_point' : null,
+      cur.id
+    );
     db.prepare('DELETE FROM room_programs WHERE room_id = ?').run(cur.id);
     return db.prepare(`${roomSelect} WHERE r.id = ?`).get(cur.id);
   });
@@ -2307,6 +2431,116 @@ app.post('/api/rooms/:code/program/clear', (req, res) => {
 
   const state = computeRoomState(updated, { now, guard, prog: null });
   res.json(buildRoomView(updated, state, now, guard, null));
+});
+
+/* ----------------------- 共享房间讨论停点（预置讨论暂停点） ----------------------- */
+// 主持人凭当前控制密钥与房间修订号原子替换整组讨论停点：互不重复的非负演出时码，
+// 均不超过房间固定版本末尾；空数组表示清除。整组校验通过后才替换：无权、过期修订号
+// 或任一非法时码均不改变房间。成功替换修订号 +1（与成功控制同一口径，已发出的交接
+// 凭证随之作废）。播放连续向上经过任一停点即自动暂停并显示原因（惰性落库、不加修订
+// 号）；继续播放须越过刚触发的停点；循环排演每次重新经过仍暂停；手动跳转与段尾瞬时
+// 跳转不触发跳过的停点；同一时码超载边界优先。停点配置不随手动跳转/交接/编排变化。
+
+/**
+ * 校验一组讨论停点，返回 { times } 或 { status, message }。
+ *  - 须为数组（空数组合法，表示清除）；
+ *  - 每项为非负有限数字且不超过版本末尾；
+ *  - 整组互不重复。
+ */
+function validateStopTimes(rawTimes, duration) {
+  if (!Array.isArray(rawTimes)) {
+    return { status: 400, message: '讨论停点无效：times 须为时码数组（空数组表示清除全部停点）' };
+  }
+  const times = [];
+  const seen = new Set();
+  for (let i = 0; i < rawTimes.length; i++) {
+    const t = toNum(rawTimes[i]);
+    if (Number.isNaN(t) || t < 0) {
+      return { status: 400, message: `第 ${i + 1} 个停点非法：${JSON.stringify(rawTimes[i])}（须为非负数字秒数）` };
+    }
+    if (t > duration + ROOM_EPS) {
+      return {
+        status: 400,
+        message: `第 ${i + 1} 个停点越界：${round6(t)}（房间固定版本长度为 ${round6(duration)} 秒，停点不得超过版本末尾）`,
+      };
+    }
+    // 去重按归整到容差后的时码判定，避免 1 与 1.0000000001 之类噪声重复
+    const key = Math.round(t / ROOM_EPS);
+    if (seen.has(key)) {
+      return { status: 400, message: `停点时码重复：${round6(t)}（一组停点内时码互不重复，整次提交已拒绝）` };
+    }
+    seen.add(key);
+    times.push(t);
+  }
+  times.sort((a, b) => a - b);
+  return { times };
+}
+
+// POST /api/rooms/:code/stops  原子替换讨论停点：
+// {control_key, revision, times:[秒数...]}（times 为空数组 = 清除）
+app.post('/api/rooms/:code/stops', (req, res) => {
+  const found = resolveRoomCode(req);
+  if (found.message) return err(res, found.status, found.message);
+  const { row } = found;
+
+  // 鉴权与修订号与 /control、/program 同一口径（错误/缺失密钥 403、过期修订号 409）
+  const auth = authorizeRoomControl(req, res, row);
+  if (auth === 403 || auth === 400) return;
+  const { key, clientRev } = auth;
+
+  const checked = validateStopTimes(req.body?.times, row.duration);
+  if (checked.message) return err(res, checked.status, checked.message);
+  const times = checked.times;
+
+  const guard = row.overload_protection ? loadRoomGuard(row.version_id) : null;
+  const now = Date.now() / 1000;
+  const tx = db.transaction(() => {
+    const cur = db.prepare(`${roomSelect} WHERE r.id = ?`).get(row.id);
+    if (cur.control_key !== key) {
+      const e = new Error('ROOM_FORBIDDEN');
+      e.code = 'ROOM_FORBIDDEN';
+      throw e;
+    }
+    if (cur.revision !== clientRev) {
+      const e = new Error(`ROOM_CONFLICT:${cur.revision}`);
+      e.code = 'ROOM_CONFLICT';
+      e.current = cur.revision;
+      throw e;
+    }
+    // 整组校验已在事务外完成；原子替换：非空 UPSERT，空组删行。
+    // 仅替换停点配置：播放/暂停、时码、速度、编排、自动暂停标记一律不动。
+    if (times.length > 0) {
+      db.prepare(
+        `INSERT INTO room_stops (room_id, times) VALUES (?, ?)
+         ON CONFLICT(room_id) DO UPDATE SET times = excluded.times`
+      ).run(cur.id, JSON.stringify(times));
+    } else {
+      db.prepare('DELETE FROM room_stops WHERE room_id = ?').run(cur.id);
+    }
+    db.prepare('UPDATE rooms SET revision = revision + 1 WHERE id = ?').run(cur.id);
+    return db.prepare(`${roomSelect} WHERE r.id = ?`).get(cur.id);
+  });
+
+  let updated;
+  try {
+    updated = tx();
+  } catch (e) {
+    if (e.code === 'ROOM_CONFLICT') {
+      return err(
+        res,
+        409,
+        `修订号冲突：提交基于修订号 ${clientRev}，房间当前已为修订号 ${e.current}；请按服务端最新状态校时后重试（本次未改动房间）`
+      );
+    }
+    if (e.code === 'ROOM_FORBIDDEN') {
+      return err(res, 403, '控制密钥无效：无权维护该房间的讨论停点（本次未改动房间）');
+    }
+    throw e;
+  }
+
+  const prog = getRoomProgram(updated.id);
+  const state = computeRoomState(updated, { now, guard, prog, stops: times });
+  res.json(buildRoomView(updated, state, now, guard, prog, times));
 });
 
 /* ----------------------- 主持权交接（一次性五分钟凭证） ----------------------- */
